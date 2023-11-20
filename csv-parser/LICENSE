@@ -1,0 +1,1113 @@
+The MIT License (MIT)
+
+Copyright (c) 2014 Mathias Buus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+//app.js
+
+let express = require('express');
+let cors = require('cors');
+let bodyParser = require('body-parser');
+let session = require('express-session');
+let app = express();
+const sequelize = require('./database');
+const User = require('./models/user');
+const ApiToken = require('./models/ApiToken');
+const Workspace = require('./models/workspace');
+const BillingQuota = require('./models/BillingQuota');
+
+const authRoutes = require('./routes/auth');
+
+app.use(session({
+    secret: 'your-secret-key', // Замените на ваш секретный ключ
+    resave: false, saveUninitialized: true, cookie: {secure: false} // Установите secure: true, если используете HTTPS
+}));
+
+
+sequelize.authenticate()
+    .then(() => console.log('Подключение к базе данных установлено.'))
+    .catch(err => console.error('Не удалось подключиться к базе данных:', err));
+
+
+// Один ко многим: Один пользователь может иметь множество рабочих пространств
+User.hasMany(Workspace);
+Workspace.belongsTo(User);
+Workspace.hasMany(ApiToken, { foreignKey: 'workspaceId' });
+ApiToken.belongsTo(Workspace, { foreignKey: 'workspaceId' });
+Workspace.hasOne(BillingQuota)
+BillingQuota.belongsTo(Workspace)
+
+sequelize.sync().then(() => {
+    console.log('Модели синхронизированы');
+});
+
+// sequelize.sync({  }).then(() => {
+//     console.log('Модели синхронизированы');
+//     // После синхронизации вызовите функцию импорта данных
+//     const importCsvData = require('./csvDataImporter'); // Путь к файлу, который вы создали
+//     importCsvData().then(() => {
+//         console.log('Данные импортированы при запуске приложения.');
+//     });
+// });
+
+
+// Настройки EJS
+app.set('view engine', 'ejs');
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({extended: true}));
+
+
+
+// Роуты
+app.use('/', authRoutes);
+
+
+let PORT = process.env.PORT || 8080;
+app.listen(PORT, function () {
+    console.log('CORS-enabled web server listening on port ' + PORT);
+});
+
+//database.js
+const { Sequelize } = require('sequelize');
+
+module.exports = new Sequelize('mobuleb', 'root', 'Pia753!!', {
+    host: 'localhost',
+    dialect: 'mysql' // или другой диалект, например 'postgres', 'sqlite', 'mssql'
+});
+
+//router/auth.js
+const express = require('express');
+const router = express.Router();
+const authController = require('../controllers/authController');
+const ApiTokenController = require('../controllers/ApiTokenController');
+const workspaceController = require('../controllers/workspaceController');
+const BillingQuotaController = require("../controllers/BillingQuotaController");
+function isAuthenticated(req, res, next) {
+    if (req.session.user) {
+        return next();
+    }
+    res.redirect('/login'); // Перенаправление на страницу входа
+}
+// auth
+router.post('/register', authController.register);
+router.post('/login', authController.login);
+router.get('/register', (req, res) => {
+    res.render('register');
+});
+router.get('/login', (req, res) => {
+    res.render('login');
+});
+
+//workspace
+router.post('/workspace', isAuthenticated, workspaceController.createWorkspace)
+router.get('/workspaces', isAuthenticated,workspaceController.getWorkspace)
+
+
+router.get('/create-workspace', isAuthenticated, (req, res) => {
+    res.render('createWorkspace');
+});
+
+router.get('/dashboard', isAuthenticated, (req, res) => {
+    res.render('dashboard', { user: req.session.user });
+});
+
+
+// Маршрут для создания нового токена API
+router.post('/api-tokens/create', isAuthenticated, ApiTokenController.create);
+
+// Маршрут для отображения списка токенов
+router.get('/api-tokens/:workspaceId', isAuthenticated, ApiTokenController.list);
+
+// Маршрут для отзыва токена
+router.post('/api-tokens/revoke/:tokenId', isAuthenticated, ApiTokenController.revokeToken);
+
+router.get('/billing-quotas/:workspaceId', isAuthenticated, BillingQuotaController.getQuota);
+router.post('/billing-quotas/set', isAuthenticated, BillingQuotaController.setQuota);
+router.post('/billing-quotas/update', isAuthenticated, BillingQuotaController.updateQuota);
+
+const BillController = require('../controllers/BillController');
+const ApiUsageController = require('../controllers/ApiUsageController');
+
+router.get('/bills/:workspaceId', BillController.getBills);
+router.get('/bills/details/:workspaceId/:billId', BillController.getBillDetails);
+router.post('/api-usage/record', ApiUsageController.recordUsage);
+router.get('/api-usage/:workspaceId', ApiUsageController.getUsageData);
+// В файле маршрутов
+
+router.post('/generate-bill/:workspaceId', async (req, res) => {
+    try {
+        const bill = await ApiUsageController.generateBill(req.params.workspaceId);
+        res.redirect('/bills/' + bill.workspaceId); // Перенаправление на страницу счетов для данного workspace
+    } catch (error) {
+        res.status(500).send(error.message);
+    }
+});
+
+router.get('/logout',isAuthenticated, authController.logout)
+module.exports = router;
+
+
+//controllers/ApiTokenController.js
+// controllers/ApiTokenController.js
+
+const ApiToken = require('../models/ApiToken');
+const Workspace = require('../models/Workspace');
+const crypto = require('crypto');
+
+const ApiTokenController = {
+    // Создание нового токена API
+    create: async (req, res) => {
+        try {
+            const { name, workspaceId } = req.body;
+            const token = crypto.randomBytes(20).toString('hex');
+            await ApiToken.create({
+                name,
+                token,
+                workspaceId
+            });
+            res.redirect('/api-tokens/' + workspaceId);
+        } catch (error) {
+            res.status(400).send('Ошибка при создании токена: ' + error.message);
+        }
+    },
+
+    // Отображение списка токенов для рабочего пространства
+    list: async (req, res) => {
+        try {
+            const workspaceId = req.params.workspaceId;
+            const workspace = await Workspace.findByPk(workspaceId);
+            const tokens = await ApiToken.findAll({
+                where: { workspaceId: workspaceId }
+            });
+            res.render('tokens', { tokens, workspace });
+        } catch (error) {
+            res.status(400).send('Ошибка при получении списка токенов: ' + error.message);
+        }
+    },
+
+    // Отзыв токена API
+    revokeToken: async (req, res) => {
+        try {
+            const tokenId = req.params.tokenId;
+            await ApiToken.update({ revokedAt: new Date() }, {
+                where: { id: tokenId }
+            });
+            res.redirect('/api-tokens/' + req.body.workspaceId); // Перенаправление обратно к списку токенов
+        } catch (error) {
+            res.status(400).send('Ошибка при отзыве токена: ' + error.message);
+        }
+    }
+
+    // Дополнительные методы по необходимости...
+};
+
+module.exports = ApiTokenController;
+
+
+
+
+
+//controllers/ApiUsageController.js
+// controllers/ApiUsageController.js
+
+const ApiUsage = require('../models/ApiUsage');
+const Bill = require('../models/Bill'); // Убедитесь, что модель счета реализована
+
+const ApiUsageController = {
+    async recordUsage(req, res) {
+        try {
+            const { apiTokenId, serviceType, durationInSeconds, costPerSecond } = req.body;
+            await ApiUsage.create({
+                apiTokenId,
+                serviceType,
+                durationInSeconds,
+                costPerSecond
+            });
+            res.send('Использование API успешно зарегистрировано.');
+        } catch (error) {
+            res.status(500).send('Ошибка при записи использования API: ' + error.message);
+        }
+    },
+
+    async getUsageData(req, res) {
+        try {
+            const workspaceId = req.params.workspaceId;
+            const usageData = await ApiUsage.findAll({
+                where: { apiTokenId: workspaceId }
+            });
+
+            if (!usageData || usageData.length === 0) {
+                return res.status(404).send('Данные об использовании не найдены.');
+            }
+
+            res.render('usage', { usageData });
+        } catch (error) {
+            res.status(500).send('Ошибка при получении данных об использовании: ' + error.message);
+        }
+    },
+
+    async generateBill(workspaceId) {
+        try {
+            const usageData = await ApiUsage.findAll({
+                where: { apiTokenId: workspaceId }
+            });
+
+            let totalCost = 0;
+            usageData.forEach(usage => {
+                totalCost += usage.durationInSeconds * usage.costPerSecond;
+            });
+
+            const bill = await Bill.create({
+                workspaceId,
+                totalCost
+            });
+
+            return bill; // Возвращаем созданный счет
+        } catch (error) {
+            throw new Error('Ошибка при генерации счета: ' + error.message);
+        }
+    }
+
+};
+
+module.exports = ApiUsageController;
+
+
+//controllers/authController.js
+
+const User = require('../models/user')
+
+
+const authController = {
+    register: async (req, res) =>{
+        try{
+            const {username, password} = req.body;
+            const user = await User.create({username, password})
+            req.session.user = {id: user.id, username: user.username}
+            res.redirect('/dashboard')
+        } catch (e) {
+            res.status(400).send(e)
+        }
+    },
+
+    logout: async(req, res) => {
+        req.session.destroy((err) => {
+            if (err) {
+                return res.redirect('/error'); // В случае ошибки остаемся на странице
+            }
+            res.clearCookie('connect.sid'); // Очистка cookie
+            res.redirect('/login');
+        });
+
+    },
+
+
+    login: async (req, res) =>{
+        try{
+            const {username, password} = req.body;
+            const user = await User.findOne({where: {username}});
+            if(!user){
+                res.status(404).send('Пользователь не сущетсвует')
+            }
+
+            if(password !== user.password){
+                res.status(403).send('Неправильный пароль')
+            }
+
+            req.session.user = {id: user.id, username: user.username}
+            res.redirect('/dashboard')
+        } catch (e) {
+            res.status(400).send(e)
+        }
+
+    },
+
+
+
+
+
+}
+
+
+module.exports = authController
+
+
+
+//controllers/BillController.js
+// controllers/BillController.js
+
+const Bill = require('../models/Bill');
+const Workspace = require('../models/Workspace');
+const ApiUsage = require("../models/ApiUsage"); // Предполагается, что у вас есть модель Workspace
+
+const BillController = {
+    async getBills(req, res) {
+        try {
+            const workspaceId = req.params.workspaceId;
+            const bills = await Bill.findAll({
+                where: { workspaceId }
+            });
+
+            if (!bills || bills.length === 0) {
+                return res.status(404).send('Счета не найдены.');
+            }
+
+            res.render('bills', { bills, workspaceId});
+        } catch (error) {
+            res.status(500).send('Ошибка при получении счетов: ' + error.message);
+        }
+    },
+
+    async getBillDetails(req, res) {
+        try {
+            const workspaceId = req.params.workspaceId;
+
+            const billId = req.params.billId;
+            const bill = await Bill.findByPk(billId);
+            const usageData = await ApiUsage.findAll({
+                where: { apiTokenId: workspaceId }
+            });
+            if (!bill) {
+                return res.status(404).send('Счет не найден.');
+            }
+
+            res.render('billDetails', { bill, usageData });
+        } catch (error) {
+            res.status(500).send('Ошибка при получении деталей счета: ' + error.message);
+        }
+    }
+};
+
+module.exports = BillController;
+
+
+//controllers/BillingQuotaController.js
+const BillingQuota = require('../models/BillingQuota')
+const Workspace = require('../models/workspace')
+const ApiUsage = require("../models/ApiUsage");
+
+function getNextMonthDate() {
+    const currentDate = new Date();
+    let nextMonthDate = new Date(currentDate);
+
+    nextMonthDate.setMonth(currentDate.getMonth() + 1);
+
+    // Обрабатываем переход на новый год
+    if (currentDate.getMonth() === 11) {
+        nextMonthDate.setFullYear(currentDate.getFullYear() + 1);
+    }
+
+    return nextMonthDate;
+}
+
+
+const BillingQuotaController = {
+    // Установка новой квоты
+    setQuota: async (req, res) => {
+        try {
+            const { workspaceId, monthlyLimit } = req.body;
+            const resetDate = getNextMonthDate();
+
+            const quota = await BillingQuota.create({
+                workspaceId,
+                monthlyLimit,
+                resetDate
+            });
+
+            res.redirect('/billing-quotas/' + workspaceId);
+        } catch (error) {
+            res.status(400).send('Ошибка при установке квоты: ' + error.message);
+        }
+    },
+
+    updateQuota: async (req, res) => {
+        try {
+            const { quotaId, monthlyLimit } = req.body;
+
+            await BillingQuota.update({ monthlyLimit }, { where: { id: quotaId } });
+
+            res.redirect('/workspaces/' + req.body.workspaceId);
+        } catch (error) {
+            res.status(400).send('Ошибка при обновлении квоты: ' + error.message);
+        }
+    },
+
+    // Отображение информации о квоте
+    getQuota: async (req, res) => {
+        try {
+            const workspaceId = req.params.workspaceId;
+            const quota = await BillingQuota.findOne({ where: { workspaceId } });
+            const workspace = await Workspace.findOne({ where: { id: workspaceId } });
+
+            res.render('quota', { quota, workspace  }); // Предполагается, что у вас есть шаблон quota.ejs
+        } catch (error) {
+            res.status(400).send('Ошибка при получении информации о квоте: ' + error.message);
+        }
+    }
+
+    // Дополнительные методы по необходимости...
+};
+
+module.exports = BillingQuotaController;
+
+
+
+//controllers/workspaceController.js
+const Workspace = require('../models/workspace')
+
+const workspaceController = {
+    createWorkspace: async (req, res) => {
+        try {
+            const {title, description} = req.body;
+            const UserId = req.session.user.id; // Используем ID пользователя из сессии
+            const workspace = await Workspace.create({title, description, UserId});
+
+            res.redirect(`/api-tokens/${workspace.id}`) ;
+        } catch (error) {
+            res.status(400).send(error);
+        }
+    },
+
+    getWorkspace: async (req, res) => {
+        try {
+            const userId = req.session.user.id;
+            const workspaces = await Workspace.findAll({where: {userId: userId}});
+            res.render('workspaces', {workspaces}); // Рендеринг страницы с списком рабочих пространств
+        } catch (error) {
+            res.status(400).send(error);
+        }
+    }
+
+}
+
+
+module.exports = workspaceController
+
+
+
+
+------models------
+--models/apitoken.js
+const {DataTypes} = require('sequelize')
+const sequelize = require('../database')
+
+const ApiToken = sequelize.define('ApiToken', {
+    name: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    token: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    workspaceId: {
+        type: DataTypes.INTEGER,
+        allowNull: false
+    },
+    revokedAt: {
+        type: DataTypes.DATE,
+        allowNull: true
+    }
+})
+
+
+module.exports = ApiToken
+
+
+--models/ApiUsage.js
+// models/ApiUsage.js
+
+const { DataTypes } = require('sequelize');
+const sequelize = require('../database');
+
+const ApiUsage = sequelize.define('ApiUsage', {
+    workspaceId: {
+        type: DataTypes.INTEGER,
+        allowNull: false
+    },
+    apiTokenId: {
+        type: DataTypes.INTEGER,
+        allowNull: false
+    },
+    serviceType: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    durationInSeconds: {
+        type: DataTypes.FLOAT,
+        allowNull: false
+    },
+    costPerSecond: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false
+    }
+});
+
+module.exports = ApiUsage;
+
+
+
+--models/Bill.js
+// models/Bill.js
+
+const { DataTypes } = require('sequelize');
+const sequelize = require('../database');
+
+const Bill = sequelize.define('Bill', {
+    workspaceId: {
+        type: DataTypes.INTEGER,
+        allowNull: false
+    },
+    totalCost: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false
+    },
+    billDate: {
+        type: DataTypes.DATE,
+        defaultValue: DataTypes.NOW
+    }
+});
+
+module.exports = Bill;
+
+
+
+--models/BillingQuota.js
+const {DataTypes} = require('sequelize')
+const sequelize = require('../database')
+
+
+const BillingQuota = sequelize.define('BillingQuota', {
+    // workspaceId: {
+    //     type: DataTypes.INTEGER,
+    //     allowNull: false
+    // },
+    monthlyLimit: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false
+    },
+    currentUsage: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: false,
+        defaultValue: 0.00
+    },
+    resetDate: {
+        type: DataTypes.DATE,
+        allowNull: false
+    }
+})
+
+
+module.exports = BillingQuota
+
+
+--models/user.js
+const {DataTypes} = require('sequelize')
+const sequelize = require('../database')
+const Workspace = require("./workspace");
+
+const User = sequelize.define('User', {
+
+        username: {
+            type: DataTypes.STRING,
+            allowNull: false
+        },
+        password: {
+            type: DataTypes.STRING,
+            allowNull: false
+        }
+    })
+
+
+module.exports = User
+
+
+--models/workspace.js
+const {DataTypes} = require('sequelize')
+const sequelize = require('../database')
+const User = require('./user')
+const Workspace = sequelize.define('Workspace', {
+    userId: {
+        type: DataTypes.INTEGER,
+        references: {
+            model: 'Users', // Название модели User
+            key: 'id' // Ключ в модели User
+        }
+    },
+    title: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    description: {
+        type: DataTypes.STRING,
+        allowNull: true
+    }
+})
+
+
+module.exports = Workspace
+
+
+
+
+
+-------routes-------
+--routes/auth.js
+const express = require('express');
+const router = express.Router();
+const authController = require('../controllers/authController');
+const ApiTokenController = require('../controllers/ApiTokenController');
+const workspaceController = require('../controllers/workspaceController');
+const BillingQuotaController = require("../controllers/BillingQuotaController");
+function isAuthenticated(req, res, next) {
+    if (req.session.user) {
+        return next();
+    }
+    res.redirect('/login'); // Перенаправление на страницу входа
+}
+// auth
+router.post('/register', authController.register);
+router.post('/login', authController.login);
+router.get('/register', (req, res) => {
+    res.render('register');
+});
+router.get('/login', (req, res) => {
+    res.render('login');
+});
+
+//workspace
+router.post('/workspace', isAuthenticated, workspaceController.createWorkspace)
+router.get('/workspaces', isAuthenticated,workspaceController.getWorkspace)
+
+
+router.get('/create-workspace', isAuthenticated, (req, res) => {
+    res.render('createWorkspace');
+});
+
+router.get('/dashboard', isAuthenticated, (req, res) => {
+    res.render('dashboard', { user: req.session.user });
+});
+
+
+// Маршрут для создания нового токена API
+router.post('/api-tokens/create', isAuthenticated, ApiTokenController.create);
+
+// Маршрут для отображения списка токенов
+router.get('/api-tokens/:workspaceId', isAuthenticated, ApiTokenController.list);
+
+// Маршрут для отзыва токена
+router.post('/api-tokens/revoke/:tokenId', isAuthenticated, ApiTokenController.revokeToken);
+
+router.get('/billing-quotas/:workspaceId', isAuthenticated, BillingQuotaController.getQuota);
+router.post('/billing-quotas/set', isAuthenticated, BillingQuotaController.setQuota);
+router.post('/billing-quotas/update', isAuthenticated, BillingQuotaController.updateQuota);
+
+const BillController = require('../controllers/BillController');
+const ApiUsageController = require('../controllers/ApiUsageController');
+
+router.get('/bills/:workspaceId', BillController.getBills);
+router.get('/bills/details/:workspaceId/:billId', BillController.getBillDetails);
+router.post('/api-usage/record', ApiUsageController.recordUsage);
+router.get('/api-usage/:workspaceId', ApiUsageController.getUsageData);
+// В файле маршрутов
+
+router.post('/generate-bill/:workspaceId', async (req, res) => {
+    try {
+        const bill = await ApiUsageController.generateBill(req.params.workspaceId);
+        res.redirect('/bills/' + bill.workspaceId); // Перенаправление на страницу счетов для данного workspace
+    } catch (error) {
+        res.status(500).send(error.message);
+    }
+});
+
+
+
+
+router.get('/logout',isAuthenticated, authController.logout)
+module.exports = router;
+
+
+
+-----views------
+--views/billDetails.ejs
+<!-- views/billDetails.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Детали счета</title>
+</head>
+<body>
+<h1>Детали счета №<%= bill.id %></h1>
+<p>Дата счета: <%= bill.billDate.toDateString() %></p>
+<h1>Использование API</h1>
+
+<% if(usageData && usageData.length > 0) { %>
+    <ul>
+        <% usageData.forEach(function(usage) { %>
+            <li>
+                Услуга: <%= usage.serviceType %>,
+                Продолжительность: <%= usage.durationInSeconds %> секунд,
+                Стоимость за секунду: $<%= Number(usage.costPerSecond).toFixed(2) %>
+            </li>
+        <% }); %>
+    </ul>
+<% } else { %>
+    <p>Данные об использовании не найдены.</p>
+<% } %>
+</body>
+<p>Общая стоимость: $<%= bill.totalCost%></p>
+<!-- Здесь можно добавить дополнительные детали счета -->
+</body>
+</html>
+
+
+
+
+<!-- views/bills.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Счета</title>
+</head>
+<body>
+<h1>Счета</h1>
+<% if (bills && bills.length > 0) { %>
+    <ul>
+        <% bills.forEach(function(bill) { %>
+            <li>
+                Счет №<%= bill.id %>,
+                Дата: <%= bill.billDate.toDateString() %>,
+                Общая стоимость: $<%= bill.totalCost %>
+                <a href="/bills/details/<%= workspaceId %>/<%= bill.id %>">Подробнее</a>
+            </li>
+        <% }); %>
+    </ul>
+<% } else { %>
+    <p>Счета не найдены.</p>
+<% } %>
+</body>
+</html>
+
+
+
+
+<!-- views/createWorkspace.ejs -->
+<form action="/workspace" method="POST">
+    <input type="text" name="title" placeholder="Название рабочего пространства" required>
+    <textarea name="description" placeholder="Описание"></textarea>
+    <button type="submit">Создать рабочее пространство</button>
+</form>
+
+
+
+<!-- views/dashboard.ejs -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+</head>
+<body>
+<h1>Добро пожаловать, <%= user.username %>!</h1>
+<a href="/logout">Выйти</a>
+<a href="/create-workspace">Создать новое рабочее пространство</a>
+<a href="/workspaces">Все рабочие простарнства</a>
+
+</body>
+</html>
+
+
+
+<!-- views/login.ejs -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Вход</title>
+</head>
+<body>
+<form action="/login" method="POST">
+    <input type="text" name="username" placeholder="Имя пользователя" required>
+    <input type="password" name="password" placeholder="Пароль" required>
+    <button type="submit">Войти</button>
+    <a href="/register">регитсрация</a>
+
+</form>
+</body>
+</html>
+
+
+
+<!-- views/quota.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Управление квотами</title>
+</head>
+<body>
+<h1>Управление квотами для <%= workspace.title %></h1>
+
+<% if (quota) { %>
+    <h2>Текущая квота: $<%= quota.monthlyLimit %></h2>
+    <p>Сброс квоты: <%= quota.resetDate.toDateString() %></p>
+    <!-- Форма для установки или обновления квоты -->
+    <form action="/billing-quotas/update" method="POST">
+        <input type="hidden" name="workspaceId" value="<%= workspace.id %>">
+        <input type="number" name="monthlyLimit" placeholder="Установить месячный лимит" required>
+        <button type="submit">Установить квоту</button>
+    </form>
+<% } else { %>
+    <!-- Форма для установки или обновления квоты -->
+    <form action="/billing-quotas/set" method="POST">
+        <input type="hidden" name="workspaceId" value="<%= workspace.id %>">
+        <input type="number" name="monthlyLimit" placeholder="Установить месячный лимит" required>
+        <button type="submit">Установить квоту</button>
+    </form>
+<% } %>
+
+
+
+<a href="/workspaces">Назад к рабочим пространствам</a>
+</body>
+</html>
+
+
+
+<!-- views/register.ejs -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Регистрация</title>
+</head>
+<body>
+<form action="/register" method="POST">
+    <input type="text" name="username" placeholder="Имя пользователя" required>
+    <input type="password" name="password" placeholder="Пароль" required>
+    <button type="submit">Регистрация</button>
+</form>
+</body>
+</html>
+
+
+
+
+<!-- views/tokens.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Токены API</title>
+</head>
+<body>
+<h1>Токены API для рабочего пространства: <%= workspace.title %></h1>
+
+<!-- Форма для создания нового токена -->
+<form action="/api-tokens/create" method="POST">
+    <input type="text" name="name" placeholder="Имя токена" required>
+    <input type="hidden" name="workspaceId" value="<%= workspace.id %>">
+    <button type="submit">Создать новый токен</button>
+</form>
+
+<h2>Существующие токены</h2>
+<ul>
+    <% tokens.forEach(function(token) { %>
+        <li>
+            <%= token.name %>
+
+            <% if (!token.revokedAt) { %>
+                <!-- Форма для отзыва токена -->
+                <span>Активен (создан: <%= token.createdAt %>)</span>
+                <span>Ключ токена <%= token.token %>)</span>
+                <form action="/api-tokens/revoke/<%= token.id %>" method="POST">
+                    <input type="hidden" name="workspaceId" value="<%= workspace.id %>">
+                    <button type="submit">Отозвать</button>
+                </form>
+            <% } else { %>
+                <!-- Информация об отозванном токене -->
+                <span>Отозван</span>
+            <% } %>
+        </li>
+    <% }); %>
+</ul>
+
+<a href="/workspaces">Назад к рабочим пространствам</a>
+</body>
+</html>
+
+
+
+
+
+<!-- views/usage.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Использование API</title>
+</head>
+<body>
+<h1>Использование API</h1>
+
+<% if(usageData && usageData.length > 0) { %>
+    <ul>
+        <% usageData.forEach(function(usage) { %>
+            <li>
+                Услуга: <%= usage.serviceType %>,
+                Продолжительность: <%= usage.durationInSeconds %> секунд,
+                Стоимость за секунду: $<%= Number(usage.costPerSecond).toFixed(2) %>
+            </li>
+        <% }); %>
+    </ul>
+<% } else { %>
+    <p>Данные об использовании не найдены.</p>
+<% } %>
+</body>
+</html>
+
+
+
+
+
+<!-- views/workspaces.ejs -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Мои рабочие пространства</title>
+</head>
+<body>
+<form action="/workspace" method="POST">
+    <input type="text" name="title" placeholder="Название рабочего пространства" required>
+    <textarea name="description" placeholder="Описание"></textarea>
+    <button type="submit">Создать рабочее пространство</button>
+</form>
+
+<h1>Рабочие пространства</h1>
+<ul>
+    <% workspaces.forEach(function(workspace) { %>
+        <li>
+            <%= workspace.title %> - <%= workspace.description %>
+            <a href="/api-tokens/<%= workspace.id %>">Управление API токенами</a>
+            <a href="/api-usage/<%= workspace.id %>">Просмотр использования API</a>
+            <a href="/bills/<%= workspace.id %>">Просмотр счетов</a>
+            <form action="/generate-bill/<%= workspace.id %>" method="post">
+                <button type="submit">Сгенерировать счет</button>
+            </form>
+        </li>
+
+    <% }); %>
+</ul>
+</body>
+</html>
+
+
+
+
+--------cvs
+
+const fs = require('fs');
+const csv = require('csv-parser');
+const sequelize = require('./database'); // Подключение к вашей базе данных
+const User = require('./models/user')
+const Workspace = require('./models/Workspace')
+const ApiToken = require('./models/ApiToken')
+const ApiUsage = require('./models/ApiUsage')
+
+const csvFilePath = './service_usages.csv'
+
+async function importCsvData() {
+    const results = [];
+
+    fs.createReadStream(csvFilePath)
+        .pipe(csv())
+        .on('data', (data) => results.push(data))
+        .on('end', async () => {
+            for (const row of results) {
+                const userId = parseInt(row.username.replace('demo', '')); // Преобразование 'demo1' в ID пользователя
+                const workspaceTitle = row.workspace_title;
+                const apiTokenName = row.api_token_name;
+                const durationInSeconds = parseFloat(row.usage_duration_in_ms) / 1000; // Оставляем в виде числа с плавающей точкой
+                const costPerSecond = parseFloat(row.service_cost_per_ms) * 1000;                const usageStartedAt = new Date(row.usage_started_at);
+                const serviceType = row.service_name;
+
+                // Поиск или создание Workspace
+                const [workspace, createdWorkspace] = await Workspace.findOrCreate({
+                    where: { title: workspaceTitle },
+                    defaults: { userId, description: '' } // Пустое описание по умолчанию
+                });
+
+                // Поиск или создание ApiToken
+                const [apiToken, createdApiToken] = await ApiToken.findOrCreate({
+                    where: { name: apiTokenName, workspaceId: workspace.id },
+                    defaults: { token: 'autogenerated_token', revokedAt: null } // Пример автоматически сгенерированного токена
+                });
+
+                // Создание записи ApiUsage
+                await ApiUsage.create({
+                    apiTokenId: apiToken.id,
+                    workspaceId: workspace.id,
+                    serviceType,
+                    durationInSeconds,
+                    costPerSecond,
+                    usageStartedAt
+                });
+            }
+            console.log('Данные успешно импортированы');
+        });
+}
+
+
+module.exports = importCsvData;
+
+
+
+
+------package
+
+{
+  "name": "expressjs-base",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "start": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.0.0",
+    "ejs": "^3.1.9",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "jsonwebtoken": "^9.0.1",
+    "mysql2": "^3.6.0",
+    "sequelize": "^6.33.0",
+    "serialize": "^0.1.3",
+    "validator": "^13.11.0"
+  }
+}
